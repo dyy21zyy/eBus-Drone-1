@@ -1,0 +1,48 @@
+
+seed: 42
+instance: medium
+horizon_min: 360
+actions_sec: [0,15,30,45,60,75,90,105,120]
+network:
+  n_stops: 30
+  stop_spacing_km: 1.0
+  stations: [1,5,9,13,17,21,25,29]
+bus:
+  passenger_capacity: 80
+  battery_max_kwh: 160
+  battery_min_kwh: 40
+  consumption_kwh_per_km: 1.6
+  speed_kmph: 30
+  freight_capacity_kg: 20
+charging:
+  chargers_per_station: 3
+  power_kw: 500
+  eff: 0.95
+  max_charge_sec: 120
+passenger:
+  lambda_mean: 0.25
+  lambda_std: 0.10
+  lambda_min: 0.05
+  lambda_max: 0.60
+  intensity: 1.0
+  board_sec: 3.0
+  alight_sec: 1.5
+parcel:
+  unload_cap_kg: 10
+  unload_sec_per_kg: 6
+  locker_cap_kg: 50
+drone:
+  num_drones: 3
+  speed_kmph: 40
+  range_round_km: 8
+  mission_max_min: 120
+  service_min: 1
+  turnaround_min: 1
+  init_full_batt: 6
+  init_depleted_batt: 0
+  batt_charge_kw: 2
+  batt_simul_max: 3
+station_power:
+  cap_kw: 1800
+  base_min_kw: 50
+  base_max_kw: 150

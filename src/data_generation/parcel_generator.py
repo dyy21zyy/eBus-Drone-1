@@ -1,0 +1,1 @@
+from .network_generator import generate_instance
