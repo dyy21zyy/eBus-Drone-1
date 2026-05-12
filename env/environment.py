@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from env.action_space import A_FULL, ActionMaskInputs
 from env.dwell_time import DwellInputs, compute_dwell_time
+from env.station_ops import Parcel, battery_charging_step, rolling_horizon_dispatch
 from rl.action_mask import get_action_mask, get_feasible_actions
 
 
@@ -29,169 +30,185 @@ class EBusDroneEnv:
     def __init__(self, config: Dict[str, Any], events: List[Event]):
         self.config = config
         self.events = sorted(events, key=lambda e: e.time)
-        self.rng = np.random.default_rng(config.get("seed", 0))
-        self._done = False
+        self.bus_ids = config["bus_ids"]
+        self.station_ids = config["station_ids"]
+        self.last_time = 0.0
         self._event_idx = 0
-        self._current_event: Optional[Event] = None
-        self._passenger_delay_acc = 0.0
-
-        self.bus_ids: List[str] = config["bus_ids"]
-        self.station_ids: List[str] = config["station_ids"]
-        self.integrated_stations = set(config["integrated_stations"])
+        self._current_event = None
+        self._done = False
 
         self.bus_battery = {b: float(config["bus_battery_init"][b]) for b in self.bus_ids}
         self.bus_passenger_load = {b: int(config["bus_passenger_init"].get(b, 0)) for b in self.bus_ids}
         self.bus_parcel_load = {b: float(config["bus_parcel_init"].get(b, 0.0)) for b in self.bus_ids}
+        self.available_chargers = {s: int(config["charger_count"][s]) for s in self.station_ids}
+        self.station_power_limit = {s: float(config["station_power_limit"][s]) for s in self.station_ids}
+        self.queue = {s: int(config["passenger_queue_init"].get(s, 0)) for s in self.station_ids}
 
-        self.queue = {(s): int(config["passenger_queue_init"].get(s, 0)) for s in self.station_ids}
-        self.locker = {(s): float(config["locker_inventory_init"].get(s, 0.0)) for s in self.station_ids}
+        self.locker = {s: [] for s in self.station_ids}
+        self.idle_drones = {s: [f"{s}_d{k}" for k in range(int(config["idle_drones_init"].get(s, 0)))] for s in self.station_ids}
+        self.active_drones: Dict[str, List[tuple[str, float]]] = {s: [] for s in self.station_ids}
+        self.full_batt = {s: int(config["full_battery_init"].get(s, 0)) for s in self.station_ids}
+        self.depleted_batt = {s: int(config["depleted_battery_init"].get(s, 0)) for s in self.station_ids}
 
-        self.idle_drones = {(s): int(config["idle_drones_init"].get(s, 0)) for s in self.station_ids}
-        self.active_drones = {(s): int(config["active_drones_init"].get(s, 0)) for s in self.station_ids}
-        self.full_batt = {(s): int(config["full_battery_init"].get(s, 0)) for s in self.station_ids}
-        self.depleted_batt = {(s): int(config["depleted_battery_init"].get(s, 0)) for s in self.station_ids}
-        self.charging_batt = {(s): int(config["charging_battery_init"].get(s, 0)) for s in self.station_ids}
-
-        self.station_power = {(s): float(config["station_power_init"].get(s, 0.0)) for s in self.station_ids}
-        self.station_power_limit = {(s): float(config["station_power_limit"][s]) for s in self.station_ids}
-        self.available_chargers = {(s): int(config["charger_count"][s]) for s in self.station_ids}
-
-        self.last_time = 0.0
+        self.delivery_completion: Dict[str, float] = {}
+        self.pending_parcels: Dict[str, Parcel] = {}
 
     def reset(self, seed=None, options=None):
-        if seed is not None:
-            self.rng = np.random.default_rng(seed)
         self._done = False
         self._event_idx = 0
-        self._passenger_delay_acc = 0.0
         self.last_time = 0.0
         self._current_event = self._find_next_decision_event()
-        obs = self._build_observation()
-        return obs, {"event": self._current_event}
+        return self._build_observation(), {"event": self._current_event}
 
-    def get_action_mask(self) -> np.ndarray:
-        event = self._current_event
-        if event is None:
+    def get_action_mask(self):
+        if self._current_event is None:
             return np.array([1] + [0] * (len(A_FULL) - 1), dtype=np.int8)
-        inputs = ActionMaskInputs(
-            charger_available=self.available_chargers[event.station_id] > 0,
-            e_current=self.bus_battery[event.bus_id],
-            e_max=self.config["e_max"],
-            eta_e=self.config["eta_e"],
-            p_chg=self.config["p_chg"],
-            u_max=max(A_FULL),
-        )
-        return get_action_mask(inputs)
+        e = self._current_event
+        return get_action_mask(ActionMaskInputs(self.available_chargers[e.station_id] > 0, self.bus_battery[e.bus_id], self.config["e_max"], self.config["eta_e"], self.config["p_chg"], max(A_FULL)))
 
-    def get_feasible_actions(self) -> list[int]:
-        event = self._current_event
-        if event is None:
+    def get_feasible_actions(self):
+        if self._current_event is None:
             return [0]
-        inputs = ActionMaskInputs(
-            charger_available=self.available_chargers[event.station_id] > 0,
-            e_current=self.bus_battery[event.bus_id],
-            e_max=self.config["e_max"],
-            eta_e=self.config["eta_e"],
-            p_chg=self.config["p_chg"],
-            u_max=max(A_FULL),
-        )
-        return get_feasible_actions(inputs)
+        e = self._current_event
+        return get_feasible_actions(ActionMaskInputs(self.available_chargers[e.station_id] > 0, self.bus_battery[e.bus_id], self.config["e_max"], self.config["eta_e"], self.config["p_chg"], max(A_FULL)))
 
     def step(self, action):
         if self._done:
-            raise RuntimeError("Environment is done. Call reset().")
-        if self._current_event is None:
-            self._done = True
-            return self._build_observation(), 0.0, True, False, {"event": None}
-
+            raise RuntimeError("done")
         if action not in self.get_feasible_actions():
-            raise ValueError(f"Infeasible action {action} at current event.")
-
+            raise ValueError("infeasible action")
         e = self._current_event
-        bus = e.bus_id
-        station = e.station_id
+        if e is None:
+            self._done = True
+            return self._build_observation(), 0.0, True, False, {"event": None, "reward_components": {}}
 
-        # 1-6 dwell and service dynamics
-        dwell = compute_dwell_time(
-            DwellInputs(
-                n_al=e.n_al,
-                n_bo0=e.n_bo0,
-                rho_al=self.config["rho_al"],
-                rho_bo=self.config["rho_bo"],
-                tau_q=self.config.get("tau_q", 0.0),
-                q_f=e.q_f,
-                rho_f=self.config["rho_f"],
-                u_r=float(action),
-                tau_e=self.config.get("tau_e", 0.0),
-                has_passenger_service=(e.n_al > 0 or e.n_bo0 > 0),
-                onboard_affected=e.onboard_before,
-            )
-        )
+        dwell = compute_dwell_time(DwellInputs(e.n_al, e.n_bo0, self.config["rho_al"], self.config["rho_bo"], self.config.get("tau_q", 0), e.q_f, self.config["rho_f"], float(action), self.config.get("tau_e", 0), (e.n_al > 0 or e.n_bo0 > 0), e.onboard_before))
 
-        # 7 passenger delay
-        self._passenger_delay_acc += dwell.passenger_delay
+        dt = dwell.t_s
+        self.bus_battery[e.bus_id] = min(self.config["e_max"], self.bus_battery[e.bus_id] + self.config["eta_e"] * self.config["p_chg"] * action / 3600.0)
+        min_energy = min(self.bus_battery[e.bus_id], self.bus_battery[e.bus_id] - self.config.get("travel_consumption_per_event", 0.0))
+        self.bus_battery[e.bus_id] = max(0.0, self.bus_battery[e.bus_id] - self.config.get("travel_consumption_per_event", 0.0))
 
-        # 8 departure and downstream propagation (compressed)
-        depart_time = e.time + dwell.t_s
+        # release parcels -> locker and trigger station dispatch
+        for k in range(int(e.q_f)):
+            pid = f"{e.bus_id}_{e.station_id}_{int(e.time)}_{k}"
+            deadline = e.time + self.config.get("default_deadline_offset", 1800.0)
+            p = Parcel(pid, f"c_{pid}", e.station_id, e.time, deadline)
+            self.locker[e.station_id].append(p)
+            self.pending_parcels[p.parcel_id] = p
 
-        # 9 battery charging + travel consumption
-        charged = self.config["eta_e"] * self.config["p_chg"] * float(action) / 3600.0
-        self.bus_battery[bus] = min(self.config["e_max"], self.bus_battery[bus] + charged)
-        self.bus_battery[bus] = max(0.0, self.bus_battery[bus] - self.config.get("travel_consumption_per_event", 0.0))
+        self._run_station_ops(e.station_id, e.time, trigger_reason="release")
 
-        # 10 charger occupancy/release
-        if action > 0 and self.available_chargers[station] > 0:
-            self.available_chargers[station] -= 1
-            self.available_chargers[station] += 1
+        self.last_time = e.time + dt
+        self._run_station_ops(e.station_id, self.last_time, trigger_reason="interval")
 
-        # 11 release assigned parcels to locker
-        self.bus_parcel_load[bus] = max(0.0, self.bus_parcel_load[bus] - e.q_f)
-        self.locker[station] += e.q_f
+        d_p = dwell.passenger_delay
+        d_l = self._collect_lateness_penalty(until=self.last_time)
+        d_e = self.config.get("eta_E_cost", 0.0) * (self.config.get("travel_consumption_per_event", 0.0) + self.config["eta_e"] * self.config["p_chg"] * action / 3600.0)
 
-        # 12-13 low-level station operations (coarse placeholders)
-        interval = max(0.0, depart_time - self.last_time)
-        dispatched = min(self.idle_drones[station], int(self.locker[station]))
-        self.idle_drones[station] -= dispatched
-        self.active_drones[station] += dispatched
-        self.locker[station] -= dispatched
-        returned = min(self.active_drones[station], int(interval // max(1.0, self.config.get("drone_cycle_time", 60.0))))
-        self.active_drones[station] -= returned
-        self.idle_drones[station] += returned
+        p_e = self.config.get("p_chg", 0.0) if action > 0 else 0.0
+        g_h, p_d, p_tot, overload = battery_charging_step(self.depleted_batt[e.station_id], self.config.get("G_max", 0), self.station_power_limit[e.station_id], p_e, self.config.get("P_L", 0.0), self.config.get("P_bat", 1.0))
+        self.depleted_batt[e.station_id] -= g_h
+        self.full_batt[e.station_id] += g_h
 
-        power_draw = self.config.get("base_station_power", 0.0) + (self.config.get("p_chg", 0.0) if action > 0 else 0.0)
-        self.station_power[station] = power_draw
+        d_pwr = self.config.get("eta_P", 1.0) * overload * dt
+        d_b = self.config.get("eta_B", 1.0) * max(0.0, self.config.get("E_min", 0.0) - min_energy)
+        d_k = self.config.get("eta_K", 1.0) * max(0.0, len(self.locker[e.station_id]) - self.config.get("locker_capacity", 999999)) * dt
 
-        # passenger queue updates
-        self.bus_passenger_load[bus] = max(0, self.bus_passenger_load[bus] - e.n_al)
-        boarded = min(self.queue[station] + e.n_bo0, max(0, self.config.get("bus_capacity_passengers", 80) - self.bus_passenger_load[bus]))
-        self.bus_passenger_load[bus] += boarded
-        self.queue[station] = max(0, self.queue[station] + int(self.config.get("arrival_rate", 0.0) * dwell.t_s) - boarded)
-
-        # 14 reward over interval
-        overload = max(0.0, self.station_power[station] - self.station_power_limit[station])
-        reward = -(
-            self.config.get("w_delay", 1.0) * dwell.passenger_delay
-            + self.config.get("w_dwell", 0.1) * dwell.t_s
-            + self.config.get("w_overload", 2.0) * overload
-        )
-
-        # 15 next decision event
-        self.last_time = depart_time
+        terminated = self.bus_battery[e.bus_id] <= 0.0
         self._current_event = self._find_next_decision_event()
-        terminated = self._current_event is None
-        self._done = terminated
+        if self._current_event is None:
+            terminated = True
+        terminal_pen = 0.0
+        if terminated:
+            for parcel in self.pending_parcels.values():
+                terminal_pen += self.config.get("eta_L_term", 0.0) * max(0.0, self.config.get("T_end", self.last_time) - parcel.deadline) + self.config.get("eta_U_term", 0.0)
 
-        # 16 return transition
-        info = {
-            "event": e,
-            "depart_time": depart_time,
-            "dwell": dwell,
-            "feasible_actions": self.get_feasible_actions() if not terminated else [0],
-            "passenger_delay_acc": self._passenger_delay_acc,
+        reward_components = {
+            "D_P": d_p,
+            "D_L": d_l,
+            "D_E": d_e,
+            "D_Pwr": d_pwr,
+            "D_B": d_b,
+            "D_K": d_k,
+            "terminal": terminal_pen,
+            "P_tot": p_tot,
+            "P_D": p_d,
         }
-        return self._build_observation(), float(reward), terminated, False, info
+        reward = -(
+            self.config.get("alpha_1", 1.0) * d_p
+            + self.config.get("alpha_2", 1.0) * d_l
+            + self.config.get("alpha_3", 1.0) * d_e
+            + self.config.get("alpha_4", 1.0) * d_pwr
+            + self.config.get("alpha_5", 1.0) * d_b
+            + self.config.get("alpha_6", 1.0) * d_k
+            + terminal_pen
+        )
+        self._done = terminated
+        return self._build_observation(), float(reward), terminated, False, {"event": e, "reward_components": reward_components}
 
-    def _find_next_decision_event(self) -> Optional[Event]:
+    def _run_station_ops(self, station_id: str, now: float, trigger_reason: str):
+        # release returns first, can trigger dispatch
+        returning = [x for x in self.active_drones[station_id] if x[1] <= now]
+        self.active_drones[station_id] = [x for x in self.active_drones[station_id] if x[1] > now]
+        for drone_id, _ in returning:
+            self.idle_drones[station_id].append(drone_id)
+            self.depleted_batt[station_id] += 1
+
+        # dispatch trigger conditions
+        should_dispatch = trigger_reason in {"release", "interval"} or len(returning) > 0
+        if not should_dispatch:
+            return
+
+        # ensure feasibility maps exist for synthetic customers
+        for p in self.locker[station_id]:
+            self.config.setdefault("drone_range_feasible", {})[(station_id, p.customer_id)] = True
+            self.config.setdefault("rt_duration_feasible", {})[(station_id, p.customer_id)] = True
+            self.config.setdefault("T_out", {})[(station_id, p.customer_id)] = self.config.get("default_T_out", 300.0)
+            self.config.setdefault("T_rt", {})[(station_id, p.customer_id)] = self.config.get("default_T_rt", 900.0)
+            self.config.setdefault("c_D", {})[(station_id, p.customer_id)] = self.config.get("default_c_D", 1.0)
+            self.config.setdefault("deadlines", {})[p.customer_id] = p.deadline
+
+        assignments = rolling_horizon_dispatch(
+            station_id=station_id,
+            now=now,
+            locker=self.locker[station_id],
+            idle_drones=self.idle_drones[station_id],
+            full_batteries=self.full_batt[station_id],
+            t_out=self.config.get("T_out", {}),
+            t_rt=self.config.get("T_rt", {}),
+            c_d=self.config.get("c_D", {}),
+            deadlines=self.config.get("deadlines", {}),
+            drone_range_feasible=self.config.get("drone_range_feasible", {}),
+            rt_duration_feasible=self.config.get("rt_duration_feasible", {}),
+            eta_l_d=self.config.get("eta_L_D", 1.0),
+            eta_u_d=self.config.get("eta_U_D", 1.0),
+        )
+        if not assignments:
+            return
+        assigned_pids = {a.parcel_id for a in assignments}
+        self.locker[station_id] = [p for p in self.locker[station_id] if p.parcel_id not in assigned_pids]
+
+        for a in assignments:
+            self.full_batt[station_id] -= 1
+            self.idle_drones[station_id].remove(a.drone_id)
+            self.active_drones[station_id].append((a.drone_id, a.return_time))
+            self.delivery_completion[a.parcel_id] = a.completion_time
+            if a.parcel_id in self.pending_parcels:
+                del self.pending_parcels[a.parcel_id]
+
+    def _collect_lateness_penalty(self, until: float) -> float:
+        penalty = 0.0
+        eta = self.config.get("eta_L_R", 1.0)
+        for pid, comp in list(self.delivery_completion.items()):
+            if comp <= until:
+                cid = pid.replace("", "")
+                deadline = self.config.get("deadlines", {}).get(cid, until)
+                penalty += eta * max(0.0, comp - deadline)
+                del self.delivery_completion[pid]
+        return penalty
+
+    def _find_next_decision_event(self):
         while self._event_idx < len(self.events):
             e = self.events[self._event_idx]
             self._event_idx += 1
@@ -199,49 +216,5 @@ class EBusDroneEnv:
                 return e
         return None
 
-    def _normalize(self, x: float, lo: float, hi: float) -> float:
-        if hi <= lo:
-            return 0.0
-        return float(np.clip((x - lo) / (hi - lo), 0.0, 1.0))
-
-    def _build_observation(self) -> np.ndarray:
-        t = self._current_event.time if self._current_event else self.last_time
-        t_day = max(1.0, self.config.get("t_day", 86400.0))
-        cyc = [np.sin(2.0 * np.pi * t / t_day), np.cos(2.0 * np.pi * t / t_day)]
-
-        bus_batt = [self._normalize(self.bus_battery[b], 0.0, self.config["e_max"]) for b in self.bus_ids]
-        bus_pax = [self._normalize(float(self.bus_passenger_load[b]), 0.0, float(self.config.get("bus_capacity_passengers", 80))) for b in self.bus_ids]
-        bus_parcel = [self._normalize(self.bus_parcel_load[b], 0.0, float(self.config.get("bus_capacity_parcels", 200))) for b in self.bus_ids]
-        queues = [self._normalize(float(self.queue[s]), 0.0, float(self.config.get("queue_max", 200))) for s in self.station_ids]
-        lockers = [self._normalize(self.locker[s], 0.0, float(self.config.get("locker_max", 500))) for s in self.station_ids]
-        idle = [self._normalize(float(self.idle_drones[s]), 0.0, float(self.config.get("drone_max", 20))) for s in self.station_ids]
-        active = [self._normalize(float(self.active_drones[s]), 0.0, float(self.config.get("drone_max", 20))) for s in self.station_ids]
-        fullb = [self._normalize(float(self.full_batt[s]), 0.0, float(self.config.get("battery_max", 100))) for s in self.station_ids]
-        depleted = [self._normalize(float(self.depleted_batt[s]), 0.0, float(self.config.get("battery_max", 100))) for s in self.station_ids]
-        charging = [self._normalize(float(self.charging_batt[s]), 0.0, float(self.config.get("battery_max", 100))) for s in self.station_ids]
-        power = [self._normalize(self.station_power[s], 0.0, self.station_power_limit[s] * 2.0) for s in self.station_ids]
-        margin = [self._normalize(max(0.0, self.station_power_limit[s] - self.station_power[s]), 0.0, self.station_power_limit[s]) for s in self.station_ids]
-        chargers = [self._normalize(float(self.available_chargers[s]), 0.0, float(self.config["charger_count"][s])) for s in self.station_ids]
-
-        local = []
-        if self._current_event is not None:
-            e = self._current_event
-            local_station_oh = [1.0 if s == e.station_id else 0.0 for s in self.station_ids]
-            local_bus_oh = [1.0 if b == e.bus_id else 0.0 for b in self.bus_ids]
-            local = local_station_oh + local_bus_oh + [
-                self._normalize(self.bus_battery[e.bus_id], 0.0, self.config["e_max"]),
-                self._normalize(float(e.onboard_before), 0.0, float(self.config.get("bus_capacity_passengers", 80))),
-                self._normalize(e.parcel_onboard_before, 0.0, float(self.config.get("bus_capacity_parcels", 200))),
-                self._normalize(float(e.n_al), 0.0, float(self.config.get("bus_capacity_passengers", 80))),
-                self._normalize(float(e.n_bo0), 0.0, float(self.config.get("queue_max", 200))),
-                self._normalize(float(e.q_f), 0.0, float(self.config.get("bus_capacity_parcels", 200))),
-                self._normalize(float(self.available_chargers[e.station_id]), 0.0, float(self.config["charger_count"][e.station_id])),
-                self._normalize(self.locker[e.station_id], 0.0, float(self.config.get("locker_max", 500))),
-                self._normalize(float(self.idle_drones[e.station_id]), 0.0, float(self.config.get("drone_max", 20))),
-                self._normalize(float(self.full_batt[e.station_id]), 0.0, float(self.config.get("battery_max", 100))),
-                self._normalize(max(0.0, self.station_power_limit[e.station_id] - self.station_power[e.station_id]), 0.0, self.station_power_limit[e.station_id]),
-                self._normalize(float(e.local_urgency), 0.0, 1.0),
-            ]
-
-        vector = np.array(cyc + bus_batt + bus_pax + bus_parcel + queues + lockers + idle + active + fullb + depleted + charging + power + margin + chargers + local, dtype=np.float32)
-        return vector
+    def _build_observation(self):
+        return np.array([self.last_time] + [self.bus_battery[b] for b in self.bus_ids] + [float(len(self.locker[s])) for s in self.station_ids], dtype=np.float32)
