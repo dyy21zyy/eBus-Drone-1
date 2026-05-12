@@ -1,0 +1,1 @@
+instance: {customers: 60, stations: 8, bus_trips: 36, headway_min: 10}
