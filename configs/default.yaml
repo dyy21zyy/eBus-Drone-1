@@ -1,0 +1,10 @@
+paths: {outputs: outputs, checkpoints: outputs/checkpoints, figures: outputs/figures}
+seed: 1
+action_set: [0,15,30,45,60,75,90,105,120]
+reward: {alpha_1: 1.0, alpha_2: 1.0, alpha_3: 1.0, alpha_4: 1.0, alpha_5: 1.0, alpha_6: 1.0}
+rl: {lr: 0.001, gamma: 0.99, batch_size: 64, replay_capacity: 5000, epsilon_start: 1.0, epsilon_end: 0.05, epsilon_decay: 0.995}
+eval: {episodes: 5}
+scenarios: {train: 20, val: 5, test: 5}
+passenger: {capacity: 80, arrival_rate_per_min: 0.25}
+parcel: {unit: kg}
+instance: {customers: 30, stations: 6, bus_trips: 24, headway_min: 15}

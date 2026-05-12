@@ -1,0 +1,10 @@
+{
+  "assignments": [
+    {
+      "bus": "b1",
+      "station": "h1",
+      "customer": "c1",
+      "x": 1
+    }
+  ]
+}
